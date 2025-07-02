@@ -1,0 +1,263 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Net.Http;
+using System.Runtime.Serialization;
+using System.Text.RegularExpressions;
+using Microsoft.Crm.Sdk.Messages;
+using Microsoft.Xrm.Sdk;
+using Microsoft.Xrm.Sdk.Query;
+
+namespace Plugins
+{
+    public class GFFLeadBusinessProcessValidation : IPlugin
+    {
+        public const string LeadProcessName = "globalfreightforwardingleadprocess";
+        public const string LeadProcessTableName = "dp_globalfreightforwardingbpf";
+        public const string OpportunityProcessName = "globalfreightforwardingopportunityprocess";
+        public const string OpportunityProcessTableName = "dp_bpfglobalfreightforwardingopportunityprocess";
+        public void Execute(IServiceProvider serviceProvider)
+        {
+            ITracingService tracingService = (ITracingService)serviceProvider.GetService(typeof(ITracingService));
+            IPluginExecutionContext context = (IPluginExecutionContext)serviceProvider.GetService(typeof(IPluginExecutionContext));
+            IOrganizationServiceFactory serviceFactory = (IOrganizationServiceFactory)serviceProvider.GetService(typeof(IOrganizationServiceFactory));
+            IOrganizationService service = serviceFactory.CreateOrganizationService(context.UserId);
+
+            if (context.InputParameters.Contains("Target") && context.InputParameters["Target"] is Entity)
+            {
+                Entity targetEntity = (Entity)context.InputParameters["Target"];
+                if (targetEntity.LogicalName == "lead")
+                {
+                    if (context.MessageName.ToUpper() == "UPDATE"
+                        || context.MessageName.ToUpper() == "CREATE")
+                    {
+                        Entity lead = GetLeadData(service, targetEntity.Id);
+                        if (lead == null)
+                        {
+                            return;
+                        }
+                        SetProcessStage(service, tracingService, targetEntity.Id, targetEntity.LogicalName, LeadProcessName, LeadProcessTableName, 1/*Attract*/, true);
+
+                    }
+                }
+                else if ((targetEntity.LogicalName == "appointment" || targetEntity.LogicalName == "phonecall"|| targetEntity.LogicalName == "email")
+                    && context.MessageName.ToUpper() == "CREATE")
+                {
+                    EntityReference regarding = targetEntity.Contains("regardingobjectid") ?
+                        targetEntity.GetAttributeValue<EntityReference>("regardingobjectid") : null;
+
+                    if (regarding == null
+                        /*|| (regarding != null && regarding.LogicalName != "lead")*/)
+                    {
+                        return;
+                    }
+                    if (regarding.LogicalName == "lead" && (targetEntity.LogicalName == "appointment" || targetEntity.LogicalName == "phonecall" || targetEntity.LogicalName == "email"))
+                    {
+                        Entity isGFFTypeBULead = GetLeadData(service, regarding.Id);
+                        if (isGFFTypeBULead == null)
+                        {
+                            return;
+                        }
+                        SetProcessStage(service, tracingService, regarding.Id, "lead", LeadProcessName, LeadProcessTableName, 2/*Qualify*/, false);
+                    }
+                    else if (regarding.LogicalName == "opportunity" && (targetEntity.LogicalName == "email" || targetEntity.LogicalName == "phonecall"))
+                    {
+                        EntityCollection activities= GetActivitiesOfOpportunity(service, regarding.Id);
+                        if(activities!=null
+                            &&activities.Entities!=null
+                            &&activities.Entities.Count>=3)
+                        {
+                            SetProcessStage(service,tracingService,regarding.Id,"opportunity",OpportunityProcessName,OpportunityProcessTableName,1,true);
+                        }
+                    }
+
+                }
+                else if (targetEntity.LogicalName == "quote" && targetEntity.Contains("opportunityid") && targetEntity["opportunityid"] is EntityReference)
+                {
+                    EntityReference opportunityRef = (EntityReference)targetEntity["opportunityid"];
+
+                    // Retrieve the Opportunity record
+                    Entity opportunity = service.Retrieve("opportunity", opportunityRef.Id, new ColumnSet("dp_dateofsubmission", "ec_opportunitynumber"));
+
+                    // Check if the Date of Quote Submission field is null or empty and opportunity belongs to GFF
+                    if (!opportunity.Contains("dp_dateofsubmission") && opportunity.GetAttributeValue<string>("ec_opportunitynumber").Contains("GFF"))
+                    {
+                        // Update the Date of Quote Submission field with the Created On date of the Quote
+                        opportunity["dp_dateofsubmission"] = targetEntity.GetAttributeValue<DateTime>("createdon");
+
+                        // Update the Opportunity record
+                        service.Update(opportunity);
+
+                        SetProcessStage(service, tracingService, opportunity.Id, "opportunity", OpportunityProcessName, OpportunityProcessTableName, 2/*Negotiate*/, true);
+                    }
+                }
+                else if (targetEntity.LogicalName == "opportunity" && targetEntity.Contains("dp_platformquoteid"))
+                {
+                    Entity updateOpportunity = new Entity("opportunity");
+                    updateOpportunity.Id = targetEntity.Id;
+                    updateOpportunity["dp_dateofsubmission"] = targetEntity.GetAttributeValue<DateTime>("modifiedon");
+                    SetProcessStage(service, tracingService, targetEntity.Id, "opportunity", OpportunityProcessName, OpportunityProcessTableName, 2/*Negotiate*/, true);
+                    service.Update(updateOpportunity);
+                }
+            }
+        }
+        public static Entity GetLeadData(IOrganizationService service, Guid leadId)
+        {
+            var fetchData = new
+            {
+                leadid = leadId.ToString(),
+                dp_businessunittype = "2"
+            };
+            var fetchXml = $@"
+                            <fetch version='1.0' output-format='xml-platform' mapping='logical' distinct='false'>
+                              <entity name='lead'>
+                                <attribute name='fullname'/>
+                                <attribute name='companyname'/>
+                                <attribute name='telephone1'/>
+                                <attribute name='leadid'/>
+                                <order attribute='fullname' descending='false'/>
+                                <filter type='and'>
+                                  <filter type='or'>
+                                    <condition attribute='parentcontactid' operator='not-null'/>
+                                    <filter type='and'>
+                                      <condition attribute='firstname' operator='not-null'/>
+                                      <condition attribute='lastname' operator='not-null'/>
+                                      <condition attribute='emailaddress1' operator='not-null'/>
+                                    </filter>
+                                  </filter>
+                                  <condition attribute='leadid' operator='eq' value='{fetchData.leadid}'/>
+                                </filter>
+                                <link-entity name='businessunit' from='businessunitid' to='dp_businessunit' link-type='inner' alias='aa'>
+                                  <filter type='and'>
+                                    <condition attribute='dp_businessunittype' operator='eq' value='{fetchData.dp_businessunittype}'/>
+                                  </filter>
+                                </link-entity>
+                              </entity>
+                            </fetch>
+                            ";
+            EntityCollection collection = service.RetrieveMultiple(new FetchExpression(fetchXml));
+            if (collection != null
+                && collection.Entities != null
+                && collection.Entities.Count == 1)
+            {
+                return collection.Entities[0];
+            }
+            return null;
+
+        }
+        public static EntityCollection GetActivitiesOfOpportunity(IOrganizationService service, Guid opportunityId)
+        {
+            var fetchData = new
+            {
+                regardingobjectid = opportunityId.ToString(),
+                dp_businessunittype = "2"
+            };
+            var fetchXml = $@"
+                        <fetch version='1.0' output-format='xml-platform' mapping='logical' distinct='false'>
+                          <entity name='activitypointer'>
+                            <attribute name='activitytypecode'/>
+                            <attribute name='subject'/>
+                            <attribute name='statecode'/>
+                            <attribute name='prioritycode'/>
+                            <attribute name='modifiedon'/>
+                            <attribute name='activityid'/>
+                            <attribute name='instancetypecode'/>
+                            <attribute name='community'/>
+                            <order attribute='modifiedon' descending='false'/>
+                            <filter type='and'>
+                              <condition attribute='regardingobjectid' operator='eq' value='{fetchData.regardingobjectid}'/>
+                            </filter>
+                            <link-entity name='opportunity' from='opportunityid' to='regardingobjectid' link-type='inner' alias='ad'>
+                              <link-entity name='businessunit' from='businessunitid' to='dp_businessunit' link-type='inner' alias='ae'>
+                                <filter type='and'>
+                                  <condition attribute='dp_businessunittype' operator='eq' value='{fetchData.dp_businessunittype}'/>
+                                </filter>
+                              </link-entity>
+                            </link-entity>
+                          </entity>
+                        </fetch>
+                        ";
+
+           return service.RetrieveMultiple(new FetchExpression(fetchXml));
+        }
+
+        public static void SetProcessStage(IOrganizationService service, ITracingService tracingService,
+            Guid tableId, string tableName, string processName, string processTableName, int stageIndex, bool stopBackward)
+        {
+            tracingService.Trace("Setting Lead Stage");
+            RetrieveProcessInstancesRequest processInstancesRequest = new RetrieveProcessInstancesRequest
+            {
+                EntityId = tableId,
+                EntityLogicalName = tableName
+            };
+            RetrieveProcessInstancesResponse processInstancesResponse = (RetrieveProcessInstancesResponse)service.Execute(processInstancesRequest);
+
+            if (processInstancesResponse.Processes.Entities.Count <= 0)
+            {
+                tracingService.Trace("No Active BPF Found");
+                return;// No Active BPF
+            }
+
+            Entity activeProcessInstance = processInstancesResponse.Processes.Entities[0]; // Active BPF
+            Guid activeProcessInstanceId = activeProcessInstance.Id; // id of Active BPF
+
+
+            tracingService.Trace("Current active process instance for the Opportunity record: '{0}'", activeProcessInstance["name"].ToString());
+            string procInstanceLogicalName = activeProcessInstance["name"].ToString().Replace(" ", string.Empty).ToLower();
+
+            tracingService.Trace("Checking process instance logical name");
+            if (procInstanceLogicalName == processName/*"globalfreightforwardingleadprocess"*/)
+            {
+                // Active stage of process instance
+                Guid activeStageId = new(activeProcessInstance.Attributes["processstageid"].ToString());
+                tracingService.Trace("ActivestageID : " + activeStageId + "");
+
+                // Retrieve the process stages of Active BPF
+                RetrieveActivePathRequest pathReq = new()
+                {
+                    ProcessInstanceId = activeProcessInstanceId
+                };
+                RetrieveActivePathResponse pathResp = (RetrieveActivePathResponse)service.Execute(pathReq);
+
+                // Process Instance Record to be updated
+
+                Entity retrievedProcessInstance = service.Retrieve(/*"dp_globalfreightforwardingbpf"*/processTableName, activeProcessInstanceId,
+                    new ColumnSet("activestageid", "traversedpath"));
+
+                //int totalStages = pathResp.ProcessStages.Entities.Count;
+                Guid closeStageId = new(pathResp.ProcessStages.Entities[stageIndex].Attributes["processstageid"].ToString());
+                // Update the active stage to the next stage
+                if (activeStageId != null
+                    && activeStageId != Guid.Empty
+                    && activeStageId.ToString().ToLower() == closeStageId.ToString().ToLower())
+                {
+                    return;
+                }
+                // if its lead update i.e name etc and stage is already Qualify then don't move to Attract
+                if (stopBackward)
+                {
+                    string traversedPathString = retrievedProcessInstance.Contains("traversedpath") ?
+                   retrievedProcessInstance.GetAttributeValue<string>("traversedpath").ToLower() : null;
+                    if (traversedPathString != null)
+                    {
+                        string[] traversedPathGuids = traversedPathString.Split(',');
+                        if (Array.IndexOf(traversedPathGuids, closeStageId.ToString()) > -1)
+                        {
+                            return;
+                        }
+                    }
+                }
+                Entity updatedBPF = new(/*"dp_globalfreightforwardingbpf"*/processTableName, activeProcessInstanceId);
+                updatedBPF["activestageid"] = new EntityReference("processstage", closeStageId);
+                service.Update(updatedBPF);
+                tracingService.Trace("BPF Updated with the stage " + activeStageId + "");
+
+
+            }
+
+        }
+
+
+    }
+}
